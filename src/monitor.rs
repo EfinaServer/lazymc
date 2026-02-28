@@ -48,9 +48,15 @@ pub async fn monitor_server(config: Arc<Config>, server: Arc<Server>) {
             // Error, reset status
             Err(_) => server.update_status(&config, None).await,
 
-            // Didn't get status, but ping fallback worked, leave as-is, show warning
+            // Didn't get status, but ping fallback worked
             Ok(None) => {
-                warn!(target: "lazymc::monitor", "Failed to poll server status, ping fallback succeeded");
+                // If server is starting, treat ping success as server being online
+                if server.state() == State::Starting {
+                    info!(target: "lazymc::monitor", "Server responded to ping while starting, marking as started");
+                    server.update_state(State::Started, &config).await;
+                } else {
+                    warn!(target: "lazymc::monitor", "Failed to poll server status, ping fallback succeeded");
+                }
             }
         }
 
@@ -84,10 +90,14 @@ pub async fn poll_server(
         return Ok(Some(status));
     }
 
-    // Try ping fallback if server is currently started
-    if server.state() == State::Started {
-        debug!(target: "lazymc::monitor", "Failed to get status from started server, trying ping...");
-        do_ping(config, addr).await?;
+    // Try ping fallback if server is currently started or starting
+    match server.state() {
+        State::Started | State::Starting => {
+            debug!(target: "lazymc::monitor", "Failed to get status from server, trying ping...");
+            do_ping(config, addr).await?;
+            return Ok(None);
+        }
+        _ => {}
     }
 
     Err(())

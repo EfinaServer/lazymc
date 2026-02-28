@@ -112,7 +112,7 @@ impl Server {
     /// This updates various other internal things depending on how the state changes.
     ///
     /// Returns false if the state didn't change, in which case nothing happens.
-    async fn update_state(&self, state: State, config: &Config) -> bool {
+    pub async fn update_state(&self, state: State, config: &Config) -> bool {
         self.update_state_from(None, state, config).await
     }
 
