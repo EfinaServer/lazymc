@@ -331,7 +331,7 @@ impl Server {
     }
 
     /// Update the last active time.
-    async fn update_last_active(&self) {
+    pub async fn update_last_active(&self) {
         self.last_active.write().await.replace(Instant::now());
     }
 

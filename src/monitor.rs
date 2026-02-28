@@ -55,7 +55,25 @@ pub async fn monitor_server(config: Arc<Config>, server: Arc<Server>) {
                     info!(target: "lazymc::monitor", "Server responded to ping while starting, marking as started");
                     server.update_state(State::Started, &config).await;
                 } else {
-                    warn!(target: "lazymc::monitor", "Failed to poll server status, ping fallback succeeded");
+                    debug!(target: "lazymc::monitor", "Failed to poll server status, ping fallback succeeded");
+
+                    // Use RCON to query player count so we can keep the server
+                    // alive when players are online but status polling is broken
+                    #[cfg(feature = "rcon")]
+                    if config.rcon.enabled {
+                        let rcon_result = query_online_players_rcon(&config).await;
+                        match rcon_result {
+                            Ok(count) => {
+                                debug!(target: "lazymc::monitor", "RCON reports {} player(s) online", count);
+                                if count > 0 {
+                                    server.update_last_active().await;
+                                }
+                            }
+                            Err(err) => {
+                                warn!(target: "lazymc::monitor", "RCON player count query failed: {}", err);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -254,4 +272,29 @@ async fn wait_for_ping_timeout(
     tokio::time::timeout(Duration::from_secs(PING_TIMEOUT), status)
         .await
         .map_err(|_| ())?
+}
+
+/// Query online player count via RCON `list` command.
+///
+/// Parses the response from the Minecraft `list` command which typically looks like:
+/// "There are X of a max of Y players online: ..."
+#[cfg(feature = "rcon")]
+async fn query_online_players_rcon(config: &Config) -> Result<u32, String> {
+    use crate::mc::rcon::Rcon;
+
+    let mut rcon = Rcon::connect_config(config)
+        .await
+        .map_err(|e| e.to_string())?;
+    let response = rcon.cmd("list").await.map_err(|e| e.to_string())?;
+    rcon.close().await;
+
+    // Parse "There are X of a max of Y players online: ..."
+    // Also handles variations like "There are X/Y players online"
+    let count = response
+        .split_whitespace()
+        .flat_map(|w| w.parse::<u32>())
+        .next()
+        .unwrap_or(0);
+
+    Ok(count)
 }
