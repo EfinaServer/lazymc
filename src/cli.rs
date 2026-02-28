@@ -35,4 +35,12 @@ pub fn app() -> Command {
                 .help("Use config file")
                 .num_args(1),
         )
+        .arg(
+            Arg::new("public-address")
+                .long("public-address")
+                .global(true)
+                .value_name("ADDRESS")
+                .help("Public address to listen on (overrides config and env)")
+                .num_args(1),
+        )
 }

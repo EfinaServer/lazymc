@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
 use clap::ArgMatches;
@@ -26,6 +26,7 @@ const ENV_PREFIX: &str = "LAZYMC_";
 const ENV_SEPARATOR: &str = "__";
 
 /// Load config from file (with optional env overrides) or purely from env vars.
+/// CLI flag overrides are applied last (highest priority).
 ///
 /// Quits with an error message on failure.
 pub fn load(matches: &ArgMatches) -> Config {
@@ -35,9 +36,9 @@ pub fn load(matches: &ArgMatches) -> Config {
         path = p;
     }
 
-    if path.is_file() {
+    let mut config = if path.is_file() {
         // Load from file, then merge env overrides
-        let config = match Config::load(path) {
+        match Config::load(path) {
             Ok(config) => config,
             Err(err) => {
                 quit_error(
@@ -49,8 +50,7 @@ pub fn load(matches: &ArgMatches) -> Config {
                         .unwrap(),
                 );
             }
-        };
-        config
+        }
     } else if has_env_config() {
         // No config file, but env vars present — build config from env
         match Config::from_env() {
@@ -75,6 +75,29 @@ pub fn load(matches: &ArgMatches) -> Config {
                 .build()
                 .unwrap(),
         );
+    };
+
+    // Apply CLI flag overrides (highest priority)
+    apply_cli_overrides(&mut config, matches);
+
+    config
+}
+
+/// Apply CLI flag overrides to the config. CLI flags have the highest priority.
+fn apply_cli_overrides(config: &mut Config, matches: &ArgMatches) {
+    if let Some(addr_str) = matches.get_one::<String>("public-address") {
+        let addr = addr_str
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next())
+            .or_else(|| addr_str.parse().ok())
+            .unwrap_or_else(|| {
+                quit_error_msg(
+                    format!("Invalid public address: {addr_str}"),
+                    ErrorHintsBuilder::default().build().unwrap(),
+                );
+            });
+        config.public.address = addr;
     }
 }
 
