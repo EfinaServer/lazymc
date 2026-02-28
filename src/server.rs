@@ -523,6 +523,39 @@ pub async fn invoke_server_cmd(
             .expect("failed to capture server stdin"),
     );
 
+    // Forward lazymc's stdin to the server process so console commands still work
+    let stdin_forward_state = state.clone();
+    let stdin_forward_task = tokio::spawn(async move {
+        use std::io::BufRead;
+        loop {
+            // Read a line from lazymc's stdin in a blocking thread
+            let line = match tokio::task::spawn_blocking(|| {
+                let mut line = String::new();
+                match std::io::stdin().lock().read_line(&mut line) {
+                    Ok(0) => None, // EOF
+                    Ok(_) => Some(line),
+                    Err(_) => None,
+                }
+            })
+            .await
+            {
+                Ok(Some(line)) => line,
+                _ => break,
+            };
+
+            // Write to server stdin
+            let mut stdin_lock = stdin_forward_state.stdin.lock().await;
+            if let Some(child_stdin) = stdin_lock.as_mut() {
+                if child_stdin.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+                let _ = child_stdin.flush().await;
+            } else {
+                break;
+            }
+        }
+    });
+
     // Wait for process to exit, handle status
     let crashed = match child.wait().await {
         Ok(status) if status.success() => {
@@ -549,7 +582,8 @@ pub async fn invoke_server_cmd(
         }
     };
 
-    // Forget server PID and stdin handle
+    // Stop stdin forwarding task and forget server PID and stdin handle
+    stdin_forward_task.abort();
     state.pid.lock().await.take();
     state.stdin.lock().await.take();
 

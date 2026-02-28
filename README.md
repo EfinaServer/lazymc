@@ -45,7 +45,7 @@ https://user-images.githubusercontent.com/856222/141378688-882082be-9efa-4cfe-81
 - Customizable MOTD and login messages
 - Automatically manages `server.properties` (host, port and RCON settings)
 - Automatically block banned IPs from server within lazymc
-- Graceful server sleep/shutdown through RCON or `SIGTERM`
+- Graceful server sleep/shutdown through stdin `stop` command, RCON or `SIGTERM`
 - RCON player count fallback when status polling fails
 - Real client IP on Minecraft server with `PROXY` header ([usage](./docs/proxy-ip.md))
 - Restart server on crash
@@ -164,6 +164,20 @@ detection strategy:
 
 This ensures the server is correctly detected as online and won't be shut down
 while players are connected, even if the status response format is non-standard.
+
+### Graceful shutdown
+
+When putting the server to sleep, lazymc uses multiple shutdown methods in order
+of preference:
+
+1. **Freeze** (Unix, if enabled) — suspends the process with `SIGSTOP` for fast resume
+2. **RCON `stop`** (if enabled) — sends the `stop` command over RCON
+3. **stdin `stop`** — writes `stop` to the server console, triggering Minecraft's
+   built-in shutdown. This works reliably on all server types without requiring RCON
+4. **`SIGTERM`** (Unix) — sends a termination signal as a last resort
+
+Console commands typed into lazymc's terminal are forwarded to the server
+process, so server administration works as expected.
 
 _Note: If a binary for your system isn't provided, please [compile from
 source](#compile-from-source). Installation options are limited at this moment. More will be added
