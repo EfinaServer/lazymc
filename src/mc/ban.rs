@@ -45,9 +45,11 @@ pub struct BannedIp {
     pub ip: IpAddr,
 
     /// Ban creation time.
+    #[allow(dead_code)]
     pub created: Option<String>,
 
     /// Ban source.
+    #[allow(dead_code)]
     pub source: Option<String>,
 
     /// Ban expiry time.

@@ -37,6 +37,7 @@ pub struct WhitelistUser {
     pub username: String,
 
     /// Whitelisted UUID.
+    #[allow(dead_code)]
     pub uuid: Option<String>,
 }
 
@@ -48,13 +49,16 @@ pub struct OpUser {
     pub username: String,
 
     /// OP UUID.
+    #[allow(dead_code)]
     pub uuid: Option<String>,
 
     /// OP level.
+    #[allow(dead_code)]
     pub level: Option<u32>,
 
     /// Whether OP can bypass player limit.
     #[serde(rename = "bypassesPlayerLimit")]
+    #[allow(dead_code)]
     pub byapsses_player_limit: Option<bool>,
 }
 

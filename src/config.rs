@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
@@ -5,6 +6,7 @@ use std::path::PathBuf;
 
 use clap::ArgMatches;
 use serde::Deserialize;
+use toml::map::Map;
 use version_compare::Cmp;
 
 use crate::proto;
@@ -17,7 +19,13 @@ pub const CONFIG_FILE: &str = "lazymc.toml";
 /// Configuration version user should be using, or warning will be shown.
 const CONFIG_VERSION: &str = "0.2.8";
 
-/// Load config from file, based on CLI arguments.
+/// Prefix for environment variable-based configuration.
+const ENV_PREFIX: &str = "LAZYMC_";
+
+/// Section separator in environment variable names.
+const ENV_SEPARATOR: &str = "__";
+
+/// Load config from file (with optional env overrides) or purely from env vars.
 ///
 /// Quits with an error message on failure.
 pub fn load(matches: &ArgMatches) -> Config {
@@ -27,11 +35,38 @@ pub fn load(matches: &ArgMatches) -> Config {
         path = p;
     }
 
-    // Ensure configuration file exists
-    if !path.is_file() {
+    if path.is_file() {
+        // Load from file, then merge env overrides
+        let config = match Config::load(path) {
+            Ok(config) => config,
+            Err(err) => {
+                quit_error(
+                    anyhow!(err).context("Failed to load config"),
+                    ErrorHintsBuilder::default()
+                        .config(true)
+                        .config_test(true)
+                        .build()
+                        .unwrap(),
+                );
+            }
+        };
+        config
+    } else if has_env_config() {
+        // No config file, but env vars present — build config from env
+        match Config::from_env() {
+            Ok(config) => config,
+            Err(err) => {
+                quit_error(
+                    anyhow!(err).context("Failed to load config from environment variables"),
+                    ErrorHintsBuilder::default().build().unwrap(),
+                );
+            }
+        }
+    } else {
         quit_error_msg(
             format!(
-                "Config file does not exist: {}",
+                "Config file does not exist: {}\n\
+                 Hint: you can also configure lazymc entirely through LAZYMC_ environment variables.",
                 path.to_str().unwrap_or("?")
             ),
             ErrorHintsBuilder::default()
@@ -41,23 +76,11 @@ pub fn load(matches: &ArgMatches) -> Config {
                 .unwrap(),
         );
     }
+}
 
-    // Load config
-    let config = match Config::load(path) {
-        Ok(config) => config,
-        Err(err) => {
-            quit_error(
-                anyhow!(err).context("Failed to load config"),
-                ErrorHintsBuilder::default()
-                    .config(true)
-                    .config_test(true)
-                    .build()
-                    .unwrap(),
-            );
-        }
-    };
-
-    config
+/// Check whether any `LAZYMC_` environment variables are set.
+pub fn has_env_config() -> bool {
+    env::vars().any(|(k, _)| k.starts_with(ENV_PREFIX))
 }
 
 /// Configuration.
@@ -106,10 +129,29 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load configuration from file.
+    /// Load configuration from file, with env var overrides merged in.
     pub fn load(path: PathBuf) -> Result<Self, io::Error> {
         let data = fs::read_to_string(&path)?;
-        let mut config: Config = toml::from_str(&data).map_err(io::Error::other)?;
+        let mut file_value: toml::Value = toml::from_str(&data).map_err(io::Error::other)?;
+
+        // Merge env var overrides on top of file config
+        let env_value = collect_env_config();
+        if env_value.as_table().map_or(false, |t| !t.is_empty()) {
+            file_value = deep_merge(file_value, env_value);
+        }
+
+        Self::from_value(file_value, Some(path))
+    }
+
+    /// Build configuration purely from environment variables and serde defaults.
+    pub fn from_env() -> Result<Self, io::Error> {
+        let env_value = collect_env_config();
+        Self::from_value(env_value, None)
+    }
+
+    /// Shared deserialization, version check, and path assignment.
+    fn from_value(value: toml::Value, path: Option<PathBuf>) -> Result<Self, io::Error> {
+        let mut config: Config = value.try_into().map_err(io::Error::other)?;
 
         // Show warning if config version is problematic
         match &config.config.version {
@@ -124,7 +166,10 @@ impl Config {
                 Ok(true) => {}
             },
         }
-        config.path.replace(path);
+
+        if let Some(p) = path {
+            config.path.replace(p);
+        }
 
         Ok(config)
     }
@@ -508,4 +553,271 @@ fn u32_150() -> u32 {
 
 fn bool_true() -> bool {
     true
+}
+
+/// Collect all `LAZYMC_` environment variables into a nested TOML table.
+///
+/// Variable names are split on `__` (double underscore) to form nested keys.
+/// For example, `LAZYMC_SERVER__ADDRESS` becomes `server.address`.
+fn collect_env_config() -> toml::Value {
+    let mut root = Map::new();
+
+    for (key, value) in env::vars() {
+        if let Some(suffix) = key.strip_prefix(ENV_PREFIX) {
+            if suffix.is_empty() {
+                continue;
+            }
+            let parts: Vec<String> = suffix.split(ENV_SEPARATOR).map(|s| s.to_lowercase()).collect();
+            let toml_val = infer_toml_value(&value);
+            insert_nested(&mut root, &parts, toml_val);
+        }
+    }
+
+    toml::Value::Table(root)
+}
+
+/// Recursively insert a value into nested TOML tables given a list of key parts.
+fn insert_nested(table: &mut Map<String, toml::Value>, keys: &[String], value: toml::Value) {
+    match keys.len() {
+        0 => {}
+        1 => {
+            table.insert(keys[0].clone(), value);
+        }
+        _ => {
+            let entry = table
+                .entry(keys[0].clone())
+                .or_insert_with(|| toml::Value::Table(Map::new()));
+            if let toml::Value::Table(ref mut sub) = entry {
+                insert_nested(sub, &keys[1..], value);
+            }
+        }
+    }
+}
+
+/// Infer the TOML type from a string value.
+///
+/// - `"true"`/`"false"` → Boolean
+/// - Parseable as `i64` → Integer
+/// - Contains `.` (no `,`) and parseable as `f64` → Float
+/// - Contains `,` → Array (split on commas, infer each element)
+/// - Otherwise → String
+fn infer_toml_value(s: &str) -> toml::Value {
+    // Boolean
+    if s.eq_ignore_ascii_case("true") {
+        return toml::Value::Boolean(true);
+    }
+    if s.eq_ignore_ascii_case("false") {
+        return toml::Value::Boolean(false);
+    }
+
+    // Integer
+    if let Ok(i) = s.parse::<i64>() {
+        return toml::Value::Integer(i);
+    }
+
+    // Float (only if contains '.' but no ',')
+    if s.contains('.') && !s.contains(',') {
+        if let Ok(f) = s.parse::<f64>() {
+            return toml::Value::Float(f);
+        }
+    }
+
+    // Comma-separated array
+    if s.contains(',') {
+        let items: Vec<toml::Value> = s.split(',').map(|item| infer_toml_value(item.trim())).collect();
+        return toml::Value::Array(items);
+    }
+
+    // Default: String
+    toml::Value::String(s.to_string())
+}
+
+/// Recursively merge two TOML values. Overlay values win; nested tables are merged.
+fn deep_merge(base: toml::Value, overlay: toml::Value) -> toml::Value {
+    match (base, overlay) {
+        (toml::Value::Table(mut base_map), toml::Value::Table(overlay_map)) => {
+            for (key, overlay_val) in overlay_map {
+                let merged = match base_map.remove(&key) {
+                    Some(base_val) => deep_merge(base_val, overlay_val),
+                    None => overlay_val,
+                };
+                base_map.insert(key, merged);
+            }
+            toml::Value::Table(base_map)
+        }
+        (_, overlay) => overlay,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_infer_toml_value_boolean() {
+        assert_eq!(infer_toml_value("true"), toml::Value::Boolean(true));
+        assert_eq!(infer_toml_value("false"), toml::Value::Boolean(false));
+        assert_eq!(infer_toml_value("TRUE"), toml::Value::Boolean(true));
+        assert_eq!(infer_toml_value("False"), toml::Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_infer_toml_value_integer() {
+        assert_eq!(infer_toml_value("42"), toml::Value::Integer(42));
+        assert_eq!(infer_toml_value("0"), toml::Value::Integer(0));
+        assert_eq!(infer_toml_value("-10"), toml::Value::Integer(-10));
+    }
+
+    #[test]
+    fn test_infer_toml_value_float() {
+        assert_eq!(infer_toml_value("3.14"), toml::Value::Float(3.14));
+    }
+
+    #[test]
+    fn test_infer_toml_value_ip_address_is_string() {
+        // IP addresses like 127.0.0.1:25565 should not parse as float
+        assert_eq!(
+            infer_toml_value("127.0.0.1:25565"),
+            toml::Value::String("127.0.0.1:25565".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_toml_value_string() {
+        assert_eq!(
+            infer_toml_value("hello world"),
+            toml::Value::String("hello world".into())
+        );
+        assert_eq!(
+            infer_toml_value("java -jar server.jar"),
+            toml::Value::String("java -jar server.jar".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_toml_value_comma_array() {
+        let val = infer_toml_value("hold,kick");
+        assert_eq!(
+            val,
+            toml::Value::Array(vec![
+                toml::Value::String("hold".into()),
+                toml::Value::String("kick".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_infer_toml_value_comma_array_integers() {
+        let val = infer_toml_value("1,2,3");
+        assert_eq!(
+            val,
+            toml::Value::Array(vec![
+                toml::Value::Integer(1),
+                toml::Value::Integer(2),
+                toml::Value::Integer(3),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_deep_merge_basic() {
+        let base: toml::Value = toml::from_str(
+            r#"
+            [server]
+            command = "java -jar server.jar"
+            address = "127.0.0.1:25566"
+            "#,
+        )
+        .unwrap();
+
+        let overlay: toml::Value = toml::from_str(
+            r#"
+            [server]
+            address = "127.0.0.1:25577"
+            "#,
+        )
+        .unwrap();
+
+        let merged = deep_merge(base, overlay);
+        let table = merged.as_table().unwrap();
+        let server = table["server"].as_table().unwrap();
+        assert_eq!(server["command"].as_str().unwrap(), "java -jar server.jar");
+        assert_eq!(server["address"].as_str().unwrap(), "127.0.0.1:25577");
+    }
+
+    #[test]
+    fn test_deep_merge_adds_new_keys() {
+        let base: toml::Value = toml::from_str(
+            r#"
+            [server]
+            command = "java -jar server.jar"
+            "#,
+        )
+        .unwrap();
+
+        let overlay: toml::Value = toml::from_str(
+            r#"
+            [rcon]
+            password = "secret"
+            "#,
+        )
+        .unwrap();
+
+        let merged = deep_merge(base, overlay);
+        let table = merged.as_table().unwrap();
+        assert_eq!(table["server"]["command"].as_str().unwrap(), "java -jar server.jar");
+        assert_eq!(table["rcon"]["password"].as_str().unwrap(), "secret");
+    }
+
+    #[test]
+    fn test_insert_nested() {
+        let mut root = Map::new();
+        insert_nested(
+            &mut root,
+            &["server".into(), "address".into()],
+            toml::Value::String("127.0.0.1:25566".into()),
+        );
+        insert_nested(
+            &mut root,
+            &["server".into(), "command".into()],
+            toml::Value::String("java -jar server.jar".into()),
+        );
+        insert_nested(
+            &mut root,
+            &["rcon".into(), "password".into()],
+            toml::Value::String("secret".into()),
+        );
+
+        let server = root["server"].as_table().unwrap();
+        assert_eq!(server["address"].as_str().unwrap(), "127.0.0.1:25566");
+        assert_eq!(server["command"].as_str().unwrap(), "java -jar server.jar");
+        assert_eq!(root["rcon"]["password"].as_str().unwrap(), "secret");
+    }
+
+    #[test]
+    fn test_collect_env_config() {
+        // Set test env vars
+        env::set_var("LAZYMC_SERVER__COMMAND", "java -jar test.jar");
+        env::set_var("LAZYMC_SERVER__ADDRESS", "127.0.0.1:25577");
+        env::set_var("LAZYMC_RCON__ENABLED", "true");
+
+        let value = collect_env_config();
+        let table = value.as_table().unwrap();
+
+        let server = table["server"].as_table().unwrap();
+        assert_eq!(
+            server["command"].as_str().unwrap(),
+            "java -jar test.jar"
+        );
+        assert_eq!(
+            server["address"].as_str().unwrap(),
+            "127.0.0.1:25577"
+        );
+        assert_eq!(table["rcon"]["enabled"].as_bool().unwrap(), true);
+
+        // Clean up
+        env::remove_var("LAZYMC_SERVER__COMMAND");
+        env::remove_var("LAZYMC_SERVER__ADDRESS");
+        env::remove_var("LAZYMC_RCON__ENABLED");
+    }
 }

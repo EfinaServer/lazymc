@@ -9,6 +9,17 @@
 #
 # You may generate a new configuration with: lazymc config generate
 # Or find the latest at: https://git.io/J1Fvq
+#
+# You can also configure lazymc entirely through environment variables
+# without this file. Use the LAZYMC_ prefix with __ as section separator:
+#   LAZYMC_SERVER__COMMAND="java -jar server.jar"  -> server.command
+#   LAZYMC_SERVER__ADDRESS="127.0.0.1:25566"       -> server.address
+#   LAZYMC_PUBLIC__ADDRESS="0.0.0.0:25565"         -> public.address
+#   LAZYMC_RCON__PASSWORD="secret"                 -> rcon.password
+#   LAZYMC_JOIN__METHODS="hold,kick"               -> join.methods (array)
+#
+# When both a config file and LAZYMC_ env vars are present, env vars
+# override the file values.
 
 [public]
 # Public address. IP and port users connect to.
@@ -173,6 +184,7 @@ command = "java -Xmx1G -Xms1G -jar server.jar --nogui"
 
 # Server RCON password.
 # Or whether to randomize password each start (recommended).
+# Tip: use LAZYMC_RCON__PASSWORD env var to avoid storing secrets in config.
 #password = ""
 #randomize_password = true
 

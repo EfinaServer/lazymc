@@ -106,6 +106,41 @@ to set up (e.g. how to fix incorrect client IPs and IP banning on your server).
 After you've read through the [extras](./docs/extras.md), everything should now
 be ready to go! Connect with your Minecraft client to wake your server up!
 
+## Environment variables
+
+You can configure lazymc entirely through environment variables, without a
+config file at all. This is ideal for Docker and CI/CD deployments.
+
+Use the `LAZYMC_` prefix with `__` (double underscore) as a section separator.
+Variable names are uppercased; they map to the corresponding lowercase TOML
+keys.
+
+| Environment variable | Config equivalent |
+|---|---|
+| `LAZYMC_SERVER__COMMAND` | `server.command` |
+| `LAZYMC_SERVER__ADDRESS` | `server.address` |
+| `LAZYMC_PUBLIC__ADDRESS` | `public.address` |
+| `LAZYMC_SERVER__FREEZE_PROCESS` | `server.freeze_process` |
+| `LAZYMC_RCON__PASSWORD` | `rcon.password` |
+| `LAZYMC_JOIN__KICK__STARTING` | `join.kick.starting` |
+| `LAZYMC_JOIN__METHODS` | `join.methods` (comma-separated: `hold,kick`) |
+
+Values are automatically inferred: `true`/`false` become booleans, numeric
+strings become integers, and comma-separated values become arrays.
+
+When both a config file and `LAZYMC_` env vars are present, the env vars
+override the file values.
+
+**Docker example:**
+
+```bash
+docker run -e LAZYMC_SERVER__COMMAND="java -jar server.jar" \
+           -e LAZYMC_SERVER__DIRECTORY="." \
+           -e LAZYMC_PUBLIC__ADDRESS="0.0.0.0:25565" \
+           -e LAZYMC_RCON__PASSWORD="s3cr3t" \
+           lazymc start
+```
+
 _Note: If a binary for your system isn't provided, please [compile from
 source](#compile-from-source). Installation options are limited at this moment. More will be added
 later._
