@@ -211,8 +211,19 @@ async fn wait_for_status(client: &Client, stream: &mut TcpStream) -> Result<Serv
 
         // Catch status response
         if packet.id == packets::status::CLIENT_STATUS {
-            let status = StatusResponse::decode(&mut packet.data.as_slice()).map_err(|_| ())?;
-            return Ok(status.server_status);
+            // Try strict protocol decode first
+            if let Ok(status) = StatusResponse::decode(&mut packet.data.as_slice()) {
+                return Ok(status.server_status);
+            }
+
+            // Fallback: lenient JSON parse for modded servers (Forge/NeoForge/Fabric)
+            // that return non-standard status responses (e.g. description as object)
+            if let Ok(status) = parse_status_json(&packet.data) {
+                debug!(target: "lazymc::monitor", "Used lenient JSON parser for server status");
+                return Ok(status);
+            }
+
+            return Err(());
         }
     }
 
@@ -272,6 +283,82 @@ async fn wait_for_ping_timeout(
     tokio::time::timeout(Duration::from_secs(PING_TIMEOUT), status)
         .await
         .map_err(|_| ())?
+}
+
+/// Leniently parse a server status JSON from raw packet data.
+///
+/// This handles modded servers (Forge/NeoForge/Fabric) that return non-standard status
+/// responses, e.g. `description` as a Chat Component object instead of a plain string.
+/// The packet data is: [var-int string length] [UTF-8 JSON bytes].
+fn parse_status_json(data: &[u8]) -> Result<ServerStatus, ()> {
+    use minecraft_protocol::version::v1_20_3::status::ServerStatus as StrictStatus;
+    use serde_json::Value;
+
+    // Read var-int string length prefix, then extract JSON bytes
+    let (prefix_len, str_len) = crate::types::read_var_int(data)?;
+    let json_bytes = data
+        .get(prefix_len..prefix_len + str_len as usize)
+        .ok_or(())?;
+    let json_str = std::str::from_utf8(json_bytes).map_err(|_| ())?;
+
+    // Try strict serde first on the raw JSON string (handles edge cases where
+    // the var-int decode differed but JSON is actually valid for the struct)
+    if let Ok(status) = serde_json::from_str::<StrictStatus>(json_str) {
+        return Ok(status);
+    }
+
+    // Parse as generic JSON value
+    let root: Value = serde_json::from_str(json_str).map_err(|_| ())?;
+
+    // Extract version
+    let version_obj = root.get("version");
+    let version_name = version_obj
+        .and_then(|v| v.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown")
+        .to_string();
+    let version_protocol = version_obj
+        .and_then(|v| v.get("protocol"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    // Extract players
+    let players_obj = root.get("players");
+    let players_online = players_obj
+        .and_then(|v| v.get("online"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let players_max = players_obj
+        .and_then(|v| v.get("max"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    // Extract description: may be a plain string or a Chat Component object
+    let description = match root.get("description") {
+        Some(Value::String(s)) => s.clone(),
+        Some(obj) => serde_json::to_string(obj).unwrap_or_default(),
+        None => String::new(),
+    };
+
+    // Extract favicon
+    let favicon = root
+        .get("favicon")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Ok(ServerStatus {
+        version: minecraft_protocol::data::server_status::ServerVersion {
+            name: version_name,
+            protocol: version_protocol,
+        },
+        players: minecraft_protocol::data::server_status::OnlinePlayers {
+            online: players_online,
+            max: players_max,
+            sample: vec![],
+        },
+        description,
+        favicon,
+    })
 }
 
 /// Query online player count via RCON `list` command.
