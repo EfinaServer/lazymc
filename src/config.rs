@@ -651,8 +651,35 @@ fn infer_toml_value(s: &str) -> toml::Value {
         return toml::Value::Array(items);
     }
 
-    // Default: String
-    toml::Value::String(s.to_string())
+    // Default: String — unescape common escape sequences so that environment
+    // variables work the same as TOML basic strings (e.g. literal `\n` becomes
+    // a real newline). This is especially important for panels like Pterodactyl
+    // that pass env var values verbatim.
+    toml::Value::String(unescape_basic(s))
+}
+
+/// Unescape common backslash escape sequences in a string (`\n`, `\t`, `\\`, `\r`).
+fn unescape_basic(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Recursively merge two TOML values. Overlay values win; nested tables are merged.
