@@ -7,6 +7,7 @@ use futures::FutureExt;
 use minecraft_protocol::version::v1_20_3::status::ServerStatus;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, Command};
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 #[cfg(feature = "rcon")]
 use tokio::sync::Semaphore;
@@ -59,6 +60,12 @@ pub struct Server {
     ///
     /// Used to send console commands (e.g., `stop`) to the server process.
     stdin: Mutex<Option<ChildStdin>>,
+
+    /// Receiver for stdin lines from the global stdin reader service.
+    ///
+    /// Lines read from lazymc's stdin are sent through this channel and forwarded
+    /// to the server process when it is running.
+    stdin_rx: Mutex<mpsc::UnboundedReceiver<String>>,
 
     /// Last known server status.
     ///
@@ -407,29 +414,37 @@ impl Server {
     }
 }
 
-impl Default for Server {
-    fn default() -> Self {
+impl Server {
+    /// Create a new server instance.
+    ///
+    /// Returns the server and a sender for forwarding stdin lines to it.
+    pub fn new() -> (Self, mpsc::UnboundedSender<String>) {
         let (state_watch_sender, state_watch_receiver) = watch::channel(State::Stopped);
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
 
-        Self {
-            state: AtomicU8::new(State::Stopped.to_u8()),
-            state_watch_sender,
-            state_watch_receiver,
-            pid: Default::default(),
-            stdin: Default::default(),
-            status: Default::default(),
-            last_active: Default::default(),
-            keep_online_until: Default::default(),
-            kill_at: Default::default(),
-            banned_ips: Default::default(),
-            whitelist: Default::default(),
-            #[cfg(feature = "rcon")]
-            rcon_lock: Semaphore::new(1),
-            #[cfg(feature = "rcon")]
-            rcon_last_stop: Default::default(),
-            probed_join_game: Default::default(),
-            forge_payload: Default::default(),
-        }
+        (
+            Self {
+                state: AtomicU8::new(State::Stopped.to_u8()),
+                state_watch_sender,
+                state_watch_receiver,
+                pid: Default::default(),
+                stdin: Default::default(),
+                stdin_rx: Mutex::new(stdin_rx),
+                status: Default::default(),
+                last_active: Default::default(),
+                keep_online_until: Default::default(),
+                kill_at: Default::default(),
+                banned_ips: Default::default(),
+                whitelist: Default::default(),
+                #[cfg(feature = "rcon")]
+                rcon_lock: Semaphore::new(1),
+                #[cfg(feature = "rcon")]
+                rcon_last_stop: Default::default(),
+                probed_join_game: Default::default(),
+                forge_payload: Default::default(),
+            },
+            stdin_tx,
+        )
     }
 }
 
@@ -516,74 +531,71 @@ pub async fn invoke_server_cmd(
         .replace(child.id().expect("unknown server PID"));
 
     // Store stdin handle for sending console commands (e.g., stop)
-    state.stdin.lock().await.replace(
-        child
-            .stdin
-            .take()
-            .expect("failed to capture server stdin"),
-    );
+    let child_stdin = child
+        .stdin
+        .take()
+        .expect("failed to capture server stdin");
+    state
+        .stdin
+        .lock()
+        .await
+        .replace(child_stdin);
 
-    // Forward lazymc's stdin to the server process so console commands still work
-    let stdin_forward_state = state.clone();
-    let stdin_forward_task = tokio::spawn(async move {
-        use std::io::BufRead;
-        loop {
-            // Read a line from lazymc's stdin in a blocking thread
-            let line = match tokio::task::spawn_blocking(|| {
-                let mut line = String::new();
-                match std::io::stdin().lock().read_line(&mut line) {
-                    Ok(0) => None, // EOF
-                    Ok(_) => Some(line),
-                    Err(_) => None,
-                }
-            })
-            .await
-            {
-                Ok(Some(line)) => line,
-                _ => break,
-            };
+    // Forward stdin lines from the global reader to the server process,
+    // while simultaneously waiting for the process to exit.
+    let mut stdin_rx = state.stdin_rx.lock().await;
 
-            // Write to server stdin
-            let mut stdin_lock = stdin_forward_state.stdin.lock().await;
-            if let Some(child_stdin) = stdin_lock.as_mut() {
-                if child_stdin.write_all(line.as_bytes()).await.is_err() {
-                    break;
+    // Drain any lines that arrived while the server was sleeping
+    while stdin_rx.try_recv().is_ok() {}
+
+    let crashed;
+    loop {
+        // Re-acquire child_stdin from state for forwarding
+        // (stop_server_stdin also uses state.stdin, so we share via state)
+        tokio::select! {
+            line = stdin_rx.recv() => {
+                if let Some(line) = line {
+                    let mut stdin_lock = state.stdin.lock().await;
+                    if let Some(child_stdin) = stdin_lock.as_mut() {
+                        if child_stdin.write_all(line.as_bytes()).await.is_err() {
+                            debug!(target: "lazymc", "Failed to forward stdin line to server");
+                        }
+                        let _ = child_stdin.flush().await;
+                    }
                 }
-                let _ = child_stdin.flush().await;
-            } else {
+            }
+            status = child.wait() => {
+                crashed = match status {
+                    Ok(status) if status.success() => {
+                        debug!(target: "lazymc", "Server process stopped successfully ({})", status);
+                        false
+                    }
+                    Ok(status)
+                        if status
+                            .code()
+                            .map(|ref code| ALLOWED_EXIT_CODES.contains(code))
+                            .unwrap_or(false) =>
+                    {
+                        debug!(target: "lazymc", "Server process stopped successfully by SIGTERM ({})", status);
+                        false
+                    }
+                    Ok(status) => {
+                        warn!(target: "lazymc", "Server process stopped with error code ({})", status);
+                        state.state() == State::Started
+                    }
+                    Err(err) => {
+                        error!(target: "lazymc", "Failed to wait for server process to quit: {}", err);
+                        error!(target: "lazymc", "Assuming server quit, cleaning up...");
+                        false
+                    }
+                };
                 break;
             }
         }
-    });
+    }
 
-    // Wait for process to exit, handle status
-    let crashed = match child.wait().await {
-        Ok(status) if status.success() => {
-            debug!(target: "lazymc", "Server process stopped successfully ({})", status);
-            false
-        }
-        Ok(status)
-            if status
-                .code()
-                .map(|ref code| ALLOWED_EXIT_CODES.contains(code))
-                .unwrap_or(false) =>
-        {
-            debug!(target: "lazymc", "Server process stopped successfully by SIGTERM ({})", status);
-            false
-        }
-        Ok(status) => {
-            warn!(target: "lazymc", "Server process stopped with error code ({})", status);
-            state.state() == State::Started
-        }
-        Err(err) => {
-            error!(target: "lazymc", "Failed to wait for server process to quit: {}", err);
-            error!(target: "lazymc", "Assuming server quit, cleaning up...");
-            false
-        }
-    };
-
-    // Stop stdin forwarding task and forget server PID and stdin handle
-    stdin_forward_task.abort();
+    // Drop stdin_rx lock and forget server PID and stdin handle
+    drop(stdin_rx);
     state.pid.lock().await.take();
     state.stdin.lock().await.take();
 

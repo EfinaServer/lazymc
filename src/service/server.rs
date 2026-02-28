@@ -21,7 +21,8 @@ use crate::util::error::{quit_error, ErrorHints};
 #[tokio::main(flavor = "multi_thread")]
 pub async fn service(config: Arc<Config>) -> Result<(), ()> {
     // Load server state
-    let server = Arc::new(Server::default());
+    let (server, stdin_tx) = Server::new();
+    let server = Arc::new(server);
 
     // Listen for new connections
     let listener = TcpListener::bind(config.public.address)
@@ -46,9 +47,10 @@ pub async fn service(config: Arc<Config>) -> Result<(), ()> {
         );
     }
 
-    // Spawn services: monitor, signal handler
+    // Spawn services: monitor, signal handler, stdin reader
     tokio::spawn(service::monitor::service(config.clone(), server.clone()));
     tokio::spawn(service::signal::service(config.clone(), server.clone()));
+    tokio::spawn(service::stdin::service(stdin_tx));
 
     // Initiate server start
     if config.server.wake_on_start {
