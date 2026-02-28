@@ -36,6 +36,7 @@ https://user-images.githubusercontent.com/856222/141378688-882082be-9efa-4cfe-81
 
 - Very efficient, lightweight & low-profile (~3KB RAM)
 - Supports Minecraft Java Edition 1.20.3+
+- Modded server support (Forge, NeoForge, Fabric) with lenient status parsing
 - Configure joining client occupation methods:
   - Hold: hold clients when server starts, relay when ready, without them noticing
   - Kick: kick clients when server starts, with a starting message
@@ -45,6 +46,7 @@ https://user-images.githubusercontent.com/856222/141378688-882082be-9efa-4cfe-81
 - Automatically manages `server.properties` (host, port and RCON settings)
 - Automatically block banned IPs from server within lazymc
 - Graceful server sleep/shutdown through RCON or `SIGTERM`
+- RCON player count fallback when status polling fails
 - Real client IP on Minecraft server with `PROXY` header ([usage](./docs/proxy-ip.md))
 - Restart server on crash
 - Lockout mode
@@ -126,7 +128,10 @@ keys.
 | `LAZYMC_JOIN__METHODS` | `join.methods` (comma-separated: `hold,kick`) |
 
 Values are automatically inferred: `true`/`false` become booleans, numeric
-strings become integers, and comma-separated values become arrays.
+strings become integers, and comma-separated values become arrays. Escape
+sequences (`\n`, `\t`, `\\`) in string values are interpreted as their
+actual characters, so MOTD and messages work correctly with panels like
+Pterodactyl.
 
 When both a config file and `LAZYMC_` env vars are present, the env vars
 override the file values.
@@ -140,6 +145,25 @@ docker run -e LAZYMC_SERVER__COMMAND="java -jar server.jar" \
            -e LAZYMC_RCON__PASSWORD="s3cr3t" \
            lazymc start
 ```
+
+## Modded server support
+
+lazymc works with modded servers (Forge, NeoForge, Fabric, etc.) out of the
+box. Modded servers sometimes return non-standard status responses that differ
+from vanilla Minecraft (e.g. the `description` field as a Chat Component object
+instead of a plain string). lazymc handles this transparently with a multi-layer
+detection strategy:
+
+1. **Strict protocol decode** — standard Minecraft status response parsing
+2. **Lenient JSON parser** — fallback that extracts player count, version, MOTD
+   and other fields from any valid JSON status response, regardless of format
+3. **Ping fallback** — confirms the server is alive when status parsing fails
+   entirely
+4. **RCON player count query** — when RCON is enabled, queries online players
+   via the `list` command as a last resort to prevent premature server shutdown
+
+This ensures the server is correctly detected as online and won't be shut down
+while players are connected, even if the status response format is non-standard.
 
 _Note: If a binary for your system isn't provided, please [compile from
 source](#compile-from-source). Installation options are limited at this moment. More will be added
