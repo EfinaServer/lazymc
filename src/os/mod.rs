@@ -70,11 +70,22 @@ pub fn unfreeze(pid: u32) -> bool {
 
 #[cfg(unix)]
 pub fn unix_signal(pid: u32, signal: Signal) -> bool {
-    match signal::kill(Pid::from_raw(pid as i32), signal) {
+    // Send signal to the process group (negative PID) so all child processes
+    // receive it. This is critical for modded servers launched via wrapper scripts,
+    // where the direct PID is the shell and Java runs as a child process.
+    let pgid = -(pid as i32);
+    match signal::kill(Pid::from_raw(pgid), signal) {
         Ok(()) => true,
-        Err(err) => {
-            warn!(target: "lazymc", "Sending {signal} signal to server failed: {err}");
-            false
+        Err(_) => {
+            // Fallback to sending directly to the process if process group signal fails
+            debug!(target: "lazymc", "Process group signal {signal} failed, trying direct PID");
+            match signal::kill(Pid::from_raw(pid as i32), signal) {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(target: "lazymc", "Sending {signal} signal to server failed: {err}");
+                    false
+                }
+            }
         }
     }
 }

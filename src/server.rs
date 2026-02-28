@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use minecraft_protocol::version::v1_20_3::status::ServerStatus;
-use tokio::process::Command;
+use tokio::io::AsyncWriteExt;
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::watch;
 #[cfg(feature = "rcon")]
 use tokio::sync::Semaphore;
@@ -53,6 +54,11 @@ pub struct Server {
     ///
     /// Set if a server process is running.
     pid: Mutex<Option<u32>>,
+
+    /// Server process stdin handle.
+    ///
+    /// Used to send console commands (e.g., `stop`) to the server process.
+    stdin: Mutex<Option<ChildStdin>>,
 
     /// Last known server status.
     ///
@@ -254,6 +260,11 @@ impl Server {
             return true;
         }
 
+        // Try to stop by sending "stop" command to server stdin
+        if stop_server_stdin(config, self).await {
+            return true;
+        }
+
         // Try to stop through signal
         #[cfg(unix)]
         if stop_server_signal(config, self).await {
@@ -405,6 +416,7 @@ impl Default for Server {
             state_watch_sender,
             state_watch_receiver,
             pid: Default::default(),
+            stdin: Default::default(),
             status: Default::default(),
             last_active: Default::default(),
             keep_online_until: Default::default(),
@@ -470,6 +482,17 @@ pub async fn invoke_server_cmd(
     let mut cmd = Command::new(&args[0]);
     cmd.args(args.iter().skip(1));
     cmd.kill_on_drop(true);
+    cmd.stdin(std::process::Stdio::piped());
+
+    // Create a new process group so signals reach all child processes
+    // (e.g., Java spawned by wrapper scripts common with modded servers)
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
 
     // Set working directory
     if let Some(ref dir) = ConfigServer::server_directory(&config) {
@@ -491,6 +514,14 @@ pub async fn invoke_server_cmd(
         .lock()
         .await
         .replace(child.id().expect("unknown server PID"));
+
+    // Store stdin handle for sending console commands (e.g., stop)
+    state.stdin.lock().await.replace(
+        child
+            .stdin
+            .take()
+            .expect("failed to capture server stdin"),
+    );
 
     // Wait for process to exit, handle status
     let crashed = match child.wait().await {
@@ -518,8 +549,9 @@ pub async fn invoke_server_cmd(
         }
     };
 
-    // Forget server PID
+    // Forget server PID and stdin handle
     state.pid.lock().await.take();
+    state.stdin.lock().await.take();
 
     // Give server a little more time to quit forgotten threads
     time::sleep(SERVER_QUIT_COOLDOWN).await;
@@ -589,6 +621,43 @@ async fn stop_server_rcon(config: &Config, server: &Server) -> bool {
     true
 }
 
+/// Stop server by writing "stop" command to its stdin.
+///
+/// This triggers Minecraft's built-in shutdown, equivalent to typing "stop" in the console.
+/// Works reliably on all server types including modded servers (Forge/NeoForge/Fabric)
+/// where SIGTERM may not trigger a proper graceful shutdown.
+async fn stop_server_stdin(config: &Config, server: &Server) -> bool {
+    let mut stdin_lock = server.stdin.lock().await;
+    let stdin = match stdin_lock.as_mut() {
+        Some(stdin) => stdin,
+        None => {
+            debug!(target: "lazymc", "Could not send stop command to server stdin, not available");
+            return false;
+        }
+    };
+
+    if let Err(err) = stdin.write_all(b"stop\n").await {
+        error!(target: "lazymc", "Failed to write stop command to server stdin: {}", err);
+        return false;
+    }
+
+    if let Err(err) = stdin.flush().await {
+        error!(target: "lazymc", "Failed to flush server stdin: {}", err);
+        return false;
+    }
+
+    info!(target: "lazymc", "Sent 'stop' command to server stdin");
+
+    server
+        .update_state_from(Some(State::Starting), State::Stopping, config)
+        .await;
+    server
+        .update_state_from(Some(State::Started), State::Stopping, config)
+        .await;
+
+    true
+}
+
 /// Stop server by sending SIGTERM signal.
 ///
 /// Only available on Unix.
@@ -634,6 +703,7 @@ async fn freeze_server_signal(config: &Config, server: &Server) -> bool {
 
     if !os::freeze(pid) {
         error!(target: "lazymc", "Failed to send freeze signal to server process.");
+        return false;
     }
 
     server
