@@ -619,12 +619,28 @@ fn insert_nested(table: &mut Map<String, toml::Value>, keys: &[String], value: t
 
 /// Infer the TOML type from a string value.
 ///
+/// - Wrapped in `[`…`]` → Array (split on commas, infer each element)
 /// - `"true"`/`"false"` → Boolean
 /// - Parseable as `i64` → Integer
 /// - Contains `.` (no `,`) and parseable as `f64` → Float
 /// - Contains `,` → Array (split on commas, infer each element)
 /// - Otherwise → String
 fn infer_toml_value(s: &str) -> toml::Value {
+    // Bracket-wrapped array: [value] or [a, b, c]
+    // Allows explicit single-element arrays like [kick] that would otherwise
+    // be inferred as a plain string.
+    let trimmed = s.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let items: Vec<toml::Value> = inner
+            .split(',')
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+            .map(|item| infer_toml_value(item))
+            .collect();
+        return toml::Value::Array(items);
+    }
+
     // Boolean
     if s.eq_ignore_ascii_case("true") {
         return toml::Value::Boolean(true);
@@ -694,6 +710,12 @@ fn deep_merge(base: toml::Value, overlay: toml::Value) -> toml::Value {
                 base_map.insert(key, merged);
             }
             toml::Value::Table(base_map)
+        }
+        // When the base is an array but the overlay is a scalar (e.g. env var
+        // with a single value like "kick"), auto-wrap it into a single-element
+        // array so it deserializes correctly into Vec<T> fields.
+        (toml::Value::Array(_), overlay) if !matches!(overlay, toml::Value::Array(_)) => {
+            toml::Value::Array(vec![overlay])
         }
         (_, overlay) => overlay,
     }
@@ -869,5 +891,56 @@ mod tests {
         env::remove_var("LAZYMC_SERVER__COMMAND");
         env::remove_var("LAZYMC_SERVER__ADDRESS");
         env::remove_var("LAZYMC_RCON__ENABLED");
+    }
+
+    #[test]
+    fn test_infer_toml_value_bracket_single_element_array() {
+        let val = infer_toml_value("[kick]");
+        assert_eq!(
+            val,
+            toml::Value::Array(vec![toml::Value::String("kick".into())])
+        );
+    }
+
+    #[test]
+    fn test_infer_toml_value_bracket_multi_element_array() {
+        let val = infer_toml_value("[hold, kick]");
+        assert_eq!(
+            val,
+            toml::Value::Array(vec![
+                toml::Value::String("hold".into()),
+                toml::Value::String("kick".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_infer_toml_value_bracket_empty_array() {
+        let val = infer_toml_value("[]");
+        assert_eq!(val, toml::Value::Array(vec![]));
+    }
+
+    #[test]
+    fn test_deep_merge_scalar_into_array() {
+        let base: toml::Value = toml::from_str(
+            r#"
+            [join]
+            methods = ["hold", "kick"]
+            "#,
+        )
+        .unwrap();
+
+        let overlay: toml::Value = toml::from_str(
+            r#"
+            [join]
+            methods = "kick"
+            "#,
+        )
+        .unwrap();
+
+        let merged = deep_merge(base, overlay);
+        let methods = merged["join"]["methods"].as_array().unwrap();
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].as_str().unwrap(), "kick");
     }
 }

@@ -127,6 +127,11 @@ keys.
 | `LAZYMC_JOIN__KICK__STARTING` | `join.kick.starting` |
 | `LAZYMC_JOIN__METHODS` | `join.methods` (comma-separated: `hold,kick`) |
 
+For array values, comma-separated strings are split automatically (e.g.
+`hold,kick`). To specify a single-element array, wrap the value in brackets
+(e.g. `[kick]`), otherwise a lone value like `kick` is interpreted as a plain
+string and will fail to deserialize into an array field.
+
 Values are automatically inferred: `true`/`false` become booleans, numeric
 strings become integers, and comma-separated values become arrays. Escape
 sequences (`\n`, `\t`, `\\`) in string values are interpreted as their

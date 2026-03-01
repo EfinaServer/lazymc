@@ -17,6 +17,7 @@
 #   LAZYMC_PUBLIC__ADDRESS="0.0.0.0:25565"         -> public.address
 #   LAZYMC_RCON__PASSWORD="secret"                 -> rcon.password
 #   LAZYMC_JOIN__METHODS="hold,kick"               -> join.methods (array)
+#   LAZYMC_JOIN__METHODS="[kick]"                  -> join.methods (single-element array)
 #
 # When both a config file and LAZYMC_ env vars are present, env vars
 # override the file values.
