@@ -14,6 +14,9 @@ const RCON_PASSWORD_LENGTH: usize = 32;
 
 /// Start lazymc.
 pub fn invoke(matches: &ArgMatches) -> Result<(), ()> {
+    // Print version info
+    info!(target: "lazymc", "Starting lazymc v{}", env!("CARGO_PKG_VERSION"));
+
     // Load config
     #[allow(unused_mut)]
     let mut config = config::load(matches);

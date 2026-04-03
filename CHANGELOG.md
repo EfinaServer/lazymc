@@ -2,6 +2,7 @@
 
 ## 0.2.20 (2026-04-03)
 
+- Log lazymc version on startup at INFO level
 - Fix: server could go to sleep with players online when the server or a plugin
   hides the real player count in the status response (always reporting `0/X`)
 - Add lenient JSON status parser for modded servers (Forge, NeoForge, Fabric)
