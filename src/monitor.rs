@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use minecraft_protocol::decoder::Decoder;
@@ -28,6 +28,16 @@ const STATUS_TIMEOUT: u64 = 20;
 /// Ping request timeout in seconds.
 const PING_TIMEOUT: u64 = 10;
 
+/// Minimum interval between RCON player-count queries.
+/// Prevents opening a new TCP + RCON handshake every MONITOR_POLL_INTERVAL (2 s).
+#[cfg(feature = "rcon")]
+const RCON_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Timeout for a single RCON player-count query.
+/// Prevents the monitor loop from stalling if the server is unresponsive.
+#[cfg(feature = "rcon")]
+const RCON_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Monitor server.
 pub async fn monitor_server(config: Arc<Config>, server: Arc<Server>) {
     // Server address
@@ -35,15 +45,93 @@ pub async fn monitor_server(config: Arc<Config>, server: Arc<Server>) {
 
     let mut poll_interval = time::interval(MONITOR_POLL_INTERVAL);
 
+    // Remember which status parser last succeeded so we try it first next time.
+    // Avoids repeatedly failing the strict decode for modded servers.
+    let mut use_lenient = false;
+
+    // Throttle RCON cross-checks so we don't open a connection every 2 s
+    #[cfg(feature = "rcon")]
+    let mut last_rcon_check: Option<Instant> = None;
+
+    // Track consecutive RCON failures so we can escalate the log level
+    #[cfg(feature = "rcon")]
+    let mut rcon_fail_streak: u32 = 0;
+
+    // Track last known player count so we only log when it changes
+    let mut last_player_count: Option<u32> = None;
+
     loop {
         poll_interval.tick().await;
 
         // Poll server state and update internal status
         trace!(target: "lazymc::monitor", "Fetching status for {} ... ", addr);
-        let status = poll_server(&config, &server, addr).await;
+        let status = poll_server(&config, &server, addr, &mut use_lenient).await;
         match status {
             // Got status, update
-            Ok(Some(status)) => server.update_status(&config, Some(status)).await,
+            Ok(Some(status)) => {
+                // If status reports 0 players, the server may be hiding its real
+                // player count (common with plugins like TAB, ProtocolLib, or
+                // hide-online-players=true). Double-check via RCON so we don't
+                // put the server to sleep while players are actually online.
+                let reported_online = status.players.online;
+                let reported_max = status.players.max;
+
+                // Log player count changes at debug level
+                if last_player_count != Some(reported_online) {
+                    debug!(
+                        target: "lazymc::monitor",
+                        "Player count changed: {} → {}/{}",
+                        last_player_count
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        reported_online,
+                        reported_max,
+                    );
+                    last_player_count = Some(reported_online);
+                }
+
+                server.update_status(&config, Some(status)).await;
+
+                #[cfg(feature = "rcon")]
+                if reported_online == 0
+                    && config.rcon.enabled
+                    && config.rcon.player_count_cross_check
+                    && last_rcon_check.map_or(true, |t| t.elapsed() >= RCON_CHECK_INTERVAL)
+                {
+                    last_rcon_check = Some(Instant::now());
+
+                    match time::timeout(RCON_QUERY_TIMEOUT, query_online_players_rcon(&config)).await {
+                        Ok(Ok(count)) => {
+                            rcon_fail_streak = 0;
+                            debug!(target: "lazymc::monitor", "Status reports 0 players; RCON reports {} player(s) online", count);
+                            if count > 0 {
+                                server.update_last_active().await;
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            rcon_fail_streak += 1;
+                            if rcon_fail_streak >= 3 {
+                                error!(
+                                    target: "lazymc::monitor",
+                                    "RCON cross-check failed {} times in a row ({}). \
+                                     Server may sleep even with players online!",
+                                    rcon_fail_streak, err,
+                                );
+                            } else {
+                                warn!(target: "lazymc::monitor", "RCON player count query failed (status=0 cross-check): {}", err);
+                            }
+                        }
+                        Err(_) => {
+                            rcon_fail_streak += 1;
+                            warn!(
+                                target: "lazymc::monitor",
+                                "RCON player count query timed out after {}s",
+                                RCON_QUERY_TIMEOUT.as_secs(),
+                            );
+                        }
+                    }
+                }
+            }
 
             // Error, reset status
             Err(_) => server.update_status(&config, None).await,
@@ -60,17 +148,40 @@ pub async fn monitor_server(config: Arc<Config>, server: Arc<Server>) {
                     // Use RCON to query player count so we can keep the server
                     // alive when players are online but status polling is broken
                     #[cfg(feature = "rcon")]
-                    if config.rcon.enabled {
-                        let rcon_result = query_online_players_rcon(&config).await;
-                        match rcon_result {
-                            Ok(count) => {
+                    if config.rcon.enabled
+                        && config.rcon.player_count_cross_check
+                        && last_rcon_check.map_or(true, |t| t.elapsed() >= RCON_CHECK_INTERVAL)
+                    {
+                        last_rcon_check = Some(Instant::now());
+
+                        match time::timeout(RCON_QUERY_TIMEOUT, query_online_players_rcon(&config)).await {
+                            Ok(Ok(count)) => {
+                                rcon_fail_streak = 0;
                                 debug!(target: "lazymc::monitor", "RCON reports {} player(s) online", count);
                                 if count > 0 {
                                     server.update_last_active().await;
                                 }
                             }
-                            Err(err) => {
-                                warn!(target: "lazymc::monitor", "RCON player count query failed: {}", err);
+                            Ok(Err(err)) => {
+                                rcon_fail_streak += 1;
+                                if rcon_fail_streak >= 3 {
+                                    error!(
+                                        target: "lazymc::monitor",
+                                        "RCON cross-check failed {} times in a row ({}). \
+                                         Server may sleep even with players online!",
+                                        rcon_fail_streak, err,
+                                    );
+                                } else {
+                                    warn!(target: "lazymc::monitor", "RCON player count query failed: {}", err);
+                                }
+                            }
+                            Err(_) => {
+                                rcon_fail_streak += 1;
+                                warn!(
+                                    target: "lazymc::monitor",
+                                    "RCON player count query timed out after {}s",
+                                    RCON_QUERY_TIMEOUT.as_secs(),
+                                );
                             }
                         }
                     }
@@ -102,9 +213,10 @@ pub async fn poll_server(
     config: &Config,
     server: &Server,
     addr: SocketAddr,
+    use_lenient: &mut bool,
 ) -> Result<Option<ServerStatus>, ()> {
     // Fetch status
-    if let Ok(status) = fetch_status(config, addr).await {
+    if let Ok(status) = fetch_status(config, addr, use_lenient).await {
         return Ok(Some(status));
     }
 
@@ -122,7 +234,7 @@ pub async fn poll_server(
 }
 
 /// Attemp to fetch status from server.
-async fn fetch_status(config: &Config, addr: SocketAddr) -> Result<ServerStatus, ()> {
+async fn fetch_status(config: &Config, addr: SocketAddr, use_lenient: &mut bool) -> Result<ServerStatus, ()> {
     let mut stream = TcpStream::connect(addr).await.map_err(|_| ())?;
 
     // Add proxy header
@@ -139,7 +251,7 @@ async fn fetch_status(config: &Config, addr: SocketAddr) -> Result<ServerStatus,
 
     send_handshake(&client, &mut stream, config, addr).await?;
     request_status(&client, &mut stream).await?;
-    wait_for_status_timeout(&client, &mut stream).await
+    wait_for_status_timeout(&client, &mut stream, use_lenient).await
 }
 
 /// Attemp to ping server.
@@ -196,7 +308,15 @@ async fn send_ping(client: &Client, stream: &mut TcpStream) -> Result<u64, ()> {
 }
 
 /// Wait for a status response.
-async fn wait_for_status(client: &Client, stream: &mut TcpStream) -> Result<ServerStatus, ()> {
+///
+/// `use_lenient` remembers which parser last succeeded. When `true` the lenient
+/// JSON parser is tried first (avoids a guaranteed-to-fail strict decode every
+/// poll for modded servers). The flag is updated on parser switches.
+async fn wait_for_status(
+    client: &Client,
+    stream: &mut TcpStream,
+    use_lenient: &mut bool,
+) -> Result<ServerStatus, ()> {
     // Get stream reader, set up buffer
     let (mut reader, mut _writer) = stream.split();
     let mut buf = BytesMut::new();
@@ -211,19 +331,11 @@ async fn wait_for_status(client: &Client, stream: &mut TcpStream) -> Result<Serv
 
         // Catch status response
         if packet.id == packets::status::CLIENT_STATUS {
-            // Try strict protocol decode first
-            if let Ok(status) = StatusResponse::decode(&mut packet.data.as_slice()) {
-                return Ok(status.server_status);
-            }
-
-            // Fallback: lenient JSON parse for modded servers (Forge/NeoForge/Fabric)
-            // that return non-standard status responses (e.g. description as object)
-            if let Ok(status) = parse_status_json(&packet.data) {
-                debug!(target: "lazymc::monitor", "Used lenient JSON parser for server status");
-                return Ok(status);
-            }
-
-            return Err(());
+            return if *use_lenient {
+                parse_lenient_first(&packet.data, use_lenient)
+            } else {
+                parse_strict_first(&packet.data, use_lenient)
+            };
         }
     }
 
@@ -231,12 +343,108 @@ async fn wait_for_status(client: &Client, stream: &mut TcpStream) -> Result<Serv
     Err(())
 }
 
+/// Try strict protocol decode first, fall back to lenient JSON.
+fn parse_strict_first(data: &[u8], use_lenient: &mut bool) -> Result<ServerStatus, ()> {
+    // Try strict protocol decode
+    let mut slice = data;
+    match StatusResponse::decode(&mut slice) {
+        Ok(resp) => {
+            trace!(target: "lazymc::monitor", "Status parsed (strict)");
+            return Ok(resp.server_status);
+        }
+        Err(err) => {
+            debug!(
+                target: "lazymc::monitor",
+                "Strict status decode failed ({:?}), falling back to lenient JSON parser",
+                err
+            );
+        }
+    }
+
+    // Fallback: lenient JSON parse
+    match parse_status_json(data) {
+        Ok(status) => {
+            *use_lenient = true;
+            info!(
+                target: "lazymc::monitor",
+                "Switching to lenient JSON parser for status (modded/non-standard server detected)"
+            );
+            log_parsed_status(&status);
+            Ok(status)
+        }
+        Err(_) => {
+            debug!(target: "lazymc::monitor", "Both strict and lenient status parsing failed, dropping packet");
+            Err(())
+        }
+    }
+}
+
+/// Try lenient JSON parse first, fall back to strict protocol decode.
+fn parse_lenient_first(data: &[u8], use_lenient: &mut bool) -> Result<ServerStatus, ()> {
+    // Try lenient JSON parse (cached preference)
+    if let Ok(status) = parse_status_json(data) {
+        trace!(
+            target: "lazymc::monitor",
+            "Status parsed (lenient): players {}/{}",
+            status.players.online,
+            status.players.max,
+        );
+        return Ok(status);
+    }
+
+    // Lenient failed unexpectedly — maybe server changed? Try strict.
+    let mut slice = data;
+    match StatusResponse::decode(&mut slice) {
+        Ok(resp) => {
+            *use_lenient = false;
+            info!(
+                target: "lazymc::monitor",
+                "Switching back to strict status parser (server now sends standard status)"
+            );
+            Ok(resp.server_status)
+        }
+        Err(_) => {
+            debug!(target: "lazymc::monitor", "Both lenient and strict status parsing failed, dropping packet");
+            Err(())
+        }
+    }
+}
+
+/// Log details of a successfully parsed status (used on parser switches to avoid spam).
+fn log_parsed_status(status: &ServerStatus) {
+    let desc: String = status
+        .description
+        .trim()
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
+    let desc_preview = {
+        let mut chars = desc.chars();
+        let truncated: String = chars.by_ref().take(60).collect();
+        if chars.next().is_some() {
+            format!("{truncated}…")
+        } else {
+            truncated
+        }
+    };
+    debug!(
+        target: "lazymc::monitor",
+        "Status: version {} (protocol {}), players: {}/{}, description: \"{}\"",
+        status.version.name,
+        status.version.protocol,
+        status.players.online,
+        status.players.max,
+        desc_preview,
+    );
+}
+
 /// Wait for a status response.
 async fn wait_for_status_timeout(
     client: &Client,
     stream: &mut TcpStream,
+    use_lenient: &mut bool,
 ) -> Result<ServerStatus, ()> {
-    let status = wait_for_status(client, stream);
+    let status = wait_for_status(client, stream, use_lenient);
     tokio::time::timeout(Duration::from_secs(STATUS_TIMEOUT), status)
         .await
         .map_err(|_| ())?
@@ -375,13 +583,50 @@ async fn query_online_players_rcon(config: &Config) -> Result<u32, String> {
     let response = rcon.cmd("list").await.map_err(|e| e.to_string())?;
     rcon.close().await;
 
-    // Parse "There are X of a max of Y players online: ..."
-    // Also handles variations like "There are X/Y players online"
-    let count = response
+    // Strip Minecraft formatting codes (§X where X is any char) so that
+    // colored RCON responses like "§c3" are parsed correctly as "3".
+    let clean = strip_minecraft_formatting(&response);
+
+    // Parse player count from the `list` response, which may look like:
+    //   "There are 3 of a max of 20 players online: player1, player2"
+    //   "There are 3/20 players online: player1, player2"   (some plugins)
+    // Strategy: walk tokens and try to parse the first one that is (or starts with) a number.
+    // Splitting on '/' handles the "X/Y" form — we only want X (the online count).
+    let count = clean
         .split_whitespace()
-        .flat_map(|w| w.parse::<u32>())
-        .next()
+        .find_map(|word| {
+            // Handle plain number ("3") and slash-separated fraction ("3/20")
+            let numeric_part = word.split('/').next().unwrap_or(word);
+            numeric_part.parse::<u32>().ok()
+        })
         .unwrap_or(0);
 
+    debug!(
+        target: "lazymc::monitor",
+        "RCON list response: {:?} → parsed {} player(s) online",
+        response.trim(),
+        count,
+    );
+
     Ok(count)
+}
+
+/// Strip Minecraft formatting codes (`§` followed by a single character).
+///
+/// Some servers / plugins return colored RCON output, e.g.
+/// `"§6There are §c3 §6of a max of §c20 §6players online:"`.
+/// Stripping these lets the numeric parser work on clean text.
+#[cfg(feature = "rcon")]
+fn strip_minecraft_formatting(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '§' {
+            // Skip the formatting character that follows §
+            chars.next();
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }

@@ -301,16 +301,22 @@ impl Server {
             return false;
         }
 
-        // Never sleep if players are online
-        let players_online = self
+        // Never sleep if players are online (may be 0 if server hides player count).
+        let (players_online, players_max) = self
             .status
             .read()
             .await
             .as_ref()
-            .map(|status| status.players.online > 0)
-            .unwrap_or(false);
-        if players_online {
-            trace!(target: "lazymc", "Not sleeping because players are online");
+            .map(|s| (s.players.online, s.players.max))
+            .unwrap_or((0, 0));
+        trace!(
+            target: "lazymc",
+            "Sleep check: status reports {}/{} players online",
+            players_online,
+            players_max,
+        );
+        if players_online > 0 {
+            trace!(target: "lazymc", "Not sleeping: status reports {} player(s) online", players_online);
             return false;
         }
 
@@ -327,8 +333,18 @@ impl Server {
         }
 
         // Last active time must have passed sleep threshold
+        let sleep_after = Duration::from_secs(config.time.sleep_after as u64);
         if let Some(last_idle) = self.last_active.read().await.as_ref() {
-            return last_idle.elapsed() >= Duration::from_secs(config.time.sleep_after as u64);
+            let elapsed = last_idle.elapsed();
+            let should = elapsed >= sleep_after;
+            trace!(
+                target: "lazymc",
+                "Sleep check: last active {:.0}s ago, threshold {}s — {}",
+                elapsed.as_secs_f64(),
+                sleep_after.as_secs(),
+                if should { "will sleep" } else { "staying awake" },
+            );
+            return should;
         }
 
         false

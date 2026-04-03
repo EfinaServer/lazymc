@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- Fix: server could go to sleep with players online when the server or a plugin
+  hides the real player count in the status response (always reporting `0/X`)
+- Add lenient JSON status parser for modded servers (Forge, NeoForge, Fabric)
+  that return non-standard status responses (e.g. `description` as a Chat
+  Component object). The chosen parser (strict/lenient) is cached and tried
+  first on every poll to avoid repeated failed decode attempts
+- Add `rcon.player_count_cross_check` config option (default `true`): when RCON
+  is enabled, periodically verify player count via RCON `list` command whenever
+  status reports 0 players, guarding against hidden player counts
+- Fix RCON `list` response parser not handling the `X/Y` player count format
+  used by some plugins, and not stripping Minecraft color codes (e.g. `§c3`)
+  which caused the count to be read as 0
+- Add timeout on RCON player count queries to prevent the monitor loop stalling
+  if the server is unresponsive
+- Throttle RCON player count cross-checks to at most once per 10 seconds
+- Escalate RCON failure log from `WARN` to `ERROR` after 3 consecutive failures
+- Improve debug/trace logging: player count changes, sleep check idle timer
+  progress, and parser switches are now clearly logged
+
 ## 0.2.11 (2024-03-16)
 
 - Add support for Minecraft 1.20.3 and 1.20.4

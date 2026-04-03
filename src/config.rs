@@ -520,6 +520,12 @@ pub struct Rcon {
 
     /// Add HAProxy v2 header to RCON connections.
     pub send_proxy_v2: bool,
+
+    /// Use RCON to cross-check player count when status reports 0 players.
+    /// Enable this if your server or plugins hide the real player count
+    /// (e.g. always reporting 0/0). Without this, lazymc trusts the status
+    /// response and does not make extra RCON connections.
+    pub player_count_cross_check: bool,
 }
 
 impl Default for Rcon {
@@ -530,6 +536,7 @@ impl Default for Rcon {
             password: "".into(),
             randomize_password: true,
             send_proxy_v2: false,
+            player_count_cross_check: true,
         }
     }
 }

@@ -46,7 +46,7 @@ https://user-images.githubusercontent.com/856222/141378688-882082be-9efa-4cfe-81
 - Automatically manages `server.properties` (host, port and RCON settings)
 - Automatically block banned IPs from server within lazymc
 - Graceful server sleep/shutdown through stdin `stop` command, RCON or `SIGTERM`
-- RCON player count fallback when status polling fails
+- RCON player count cross-check for servers that hide player count (configurable)
 - Real client IP on Minecraft server with `PROXY` header ([usage](./docs/proxy-ip.md))
 - Restart server on crash
 - Lockout mode
@@ -159,13 +159,23 @@ from vanilla Minecraft (e.g. the `description` field as a Chat Component object
 instead of a plain string). lazymc handles this transparently with a multi-layer
 detection strategy:
 
-1. **Strict protocol decode** — standard Minecraft status response parsing
-2. **Lenient JSON parser** — fallback that extracts player count, version, MOTD
-   and other fields from any valid JSON status response, regardless of format
+1. **Strict protocol decode** — standard Minecraft status response parsing.
+   If this succeeds it is used for all subsequent polls (cached).
+2. **Lenient JSON parser** — fallback for non-standard responses that extracts
+   player count, version, MOTD and other fields from any valid JSON, regardless
+   of format. Once a parser is chosen it is cached and tried first on every poll;
+   a one-time `INFO` log is emitted when the parser switches. Player count
+   changes are logged at `DEBUG` level.
 3. **Ping fallback** — confirms the server is alive when status parsing fails
-   entirely
-4. **RCON player count query** — when RCON is enabled, queries online players
-   via the `list` command as a last resort to prevent premature server shutdown
+   entirely.
+4. **RCON player count cross-check** — when RCON is enabled and
+   `rcon.player_count_cross_check = true` (default), lazymc periodically queries
+   the real player count via the RCON `list` command whenever the status reports
+   0 players. This protects against servers or plugins that deliberately hide
+   the player count (e.g. always reporting `0/0`), preventing lazymc from
+   putting the server to sleep while players are actually connected.
+   Disable this if your server reports player count honestly to avoid the extra
+   RCON connections.
 
 This ensures the server is correctly detected as online and won't be shut down
 while players are connected, even if the status response format is non-standard.
