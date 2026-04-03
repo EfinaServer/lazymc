@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.20 (2026-04-03)
 
 - Fix: server could go to sleep with players online when the server or a plugin
   hides the real player count in the status response (always reporting `0/X`)
@@ -20,6 +20,68 @@
 - Escalate RCON failure log from `WARN` to `ERROR` after 3 consecutive failures
 - Improve debug/trace logging: player count changes, sleep check idle timer
   progress, and parser switches are now clearly logged
+
+## 0.2.19 (2026-03-01)
+
+- Fix single-value env var arrays failing to deserialize into `Vec` fields; add
+  bracket syntax (`[kick]`) to force a single-element array, and auto-coerce a
+  plain scalar to an array when the target config field is an array type
+
+## 0.2.18 (2026-02-28)
+
+- Fix Pterodactyl panel (and similar hosted-console) stdin forwarding: replace
+  the per-server-invocation stdin reader with a single persistent global stdin
+  reader that runs for lazymc's entire lifetime, preventing zombie threads from
+  stealing console input on server restarts
+
+## 0.2.17 (2026-02-28)
+
+- Add stdin stop command: write `stop` to the server's stdin as the primary
+  non-RCON graceful shutdown method, working reliably on all server types
+  including modded servers where SIGTERM may not trigger a clean shutdown
+- Forward lazymc's own stdin to the server process so server console commands
+  typed in the terminal continue to work
+
+## 0.2.16 (2026-02-28)
+
+- Fix server not gracefully shutting down on modded servers (Forge, NeoForge,
+  Fabric): add stdin-based `stop` method, send signals to the process group
+  (with PID fallback for wrapper scripts), and fix `freeze_server_signal`
+  masking failures and preventing fallback to other stop methods
+- Shutdown method priority is now: freeze → RCON `stop` → stdin `stop` → SIGTERM
+
+## 0.2.15 (2026-02-28)
+
+- Add lenient JSON parser for modded server status responses; handles
+  Forge/NeoForge/Fabric servers that return a `description` field as a Chat
+  Component object instead of a plain string, extracting player count, version
+  and MOTD from any valid JSON structure
+- Use RCON to query player count when status polling fails; prevents the server
+  from sleeping while players are connected when modded servers return broken
+  or unparseable status responses
+
+## 0.2.14 (2026-02-28)
+
+- Fix modded servers (NeoForge, Forge, Fabric) getting stuck in Starting state
+  when status fetches fail or time out; ping fallback now also runs during
+  Starting and a successful ping triggers the Started transition
+- Fix literal `\n`, `\t`, `\r`, `\\` escape sequences in MOTD and messages
+  configured via environment variables (e.g. from Pterodactyl Panel)
+
+## 0.2.13 (2026-02-28)
+
+- Add `--public-address` CLI flag to set `public.address`; takes precedence
+  over both environment variables and the config file
+
+## 0.2.12 (2026-02-28)
+
+- Add `LAZYMC_` environment variable configuration; configure lazymc entirely
+  without a config file using the `LAZYMC_` prefix with `__` as a section
+  separator (e.g. `LAZYMC_SERVER__COMMAND`); env vars override config file
+  values when both are present; removes the previous `${VAR}` in-file
+  substitution feature
+- Add manual release workflow for automated multi-platform builds (Linux, macOS,
+  Windows; x86_64 and aarch64)
 
 ## 0.2.11 (2024-03-16)
 
