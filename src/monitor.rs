@@ -134,7 +134,115 @@ pub async fn monitor_server(config: Arc<Config>, server: Arc<Server>) {
             }
 
             // Error, reset status
-            Err(_) => server.update_status(&config, None).await,
+            Err(_) => {
+                // For servers like Folia that never respond to status/ping probes,
+                // use RCON as the health signal before transitioning state.
+                //
+                // - Starting: a successful RCON handshake is enough to mark the
+                //   server online (list command may not be available yet).
+                // - Started: run `list` via RCON — this both confirms the server
+                //   is alive and gives the real player count so the sleep timer
+                //   resets correctly when players are connected.
+                #[cfg(feature = "rcon")]
+                let rcon_alive = if config.rcon.enabled
+                    && matches!(server.state(), State::Starting | State::Started)
+                {
+                    match server.state() {
+                        State::Starting => {
+                            use crate::mc::rcon::Rcon;
+                            let result = time::timeout(
+                                RCON_QUERY_TIMEOUT,
+                                async {
+                                    Rcon::connect_config(&config)
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                },
+                            )
+                            .await;
+                            match result {
+                                Ok(Ok(rcon)) => {
+                                    rcon.close().await;
+                                    true
+                                }
+                                _ => false,
+                            }
+                        }
+                        State::Started => {
+                            // Use list command: health check + player count in one shot.
+                            // Not throttled — status/ping are unavailable so this is
+                            // the only crash-detection signal; we need it every poll.
+                            match time::timeout(
+                                RCON_QUERY_TIMEOUT,
+                                query_online_players_rcon(&config),
+                            )
+                            .await
+                            {
+                                Ok(Ok(count)) => {
+                                    rcon_fail_streak = 0;
+                                    debug!(
+                                        target: "lazymc::monitor",
+                                        "Status/ping unavailable; RCON reports {} player(s) online",
+                                        count,
+                                    );
+                                    if count > 0 {
+                                        server.update_last_active().await;
+                                    }
+                                    true
+                                }
+                                Ok(Err(err)) => {
+                                    rcon_fail_streak += 1;
+                                    if rcon_fail_streak >= 3 {
+                                        error!(
+                                            target: "lazymc::monitor",
+                                            "RCON health check failed {} times in a row ({}). \
+                                             Server may be offline!",
+                                            rcon_fail_streak, err,
+                                        );
+                                    } else {
+                                        debug!(
+                                            target: "lazymc::monitor",
+                                            "RCON health check failed: {}",
+                                            err,
+                                        );
+                                    }
+                                    false
+                                }
+                                Err(_) => {
+                                    rcon_fail_streak += 1;
+                                    warn!(
+                                        target: "lazymc::monitor",
+                                        "RCON health check timed out after {}s",
+                                        RCON_QUERY_TIMEOUT.as_secs(),
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+
+                #[cfg(not(feature = "rcon"))]
+                let rcon_alive = false;
+
+                if rcon_alive {
+                    // RCON confirms the server is up; handle state transitions.
+                    #[cfg(feature = "rcon")]
+                    if server.state() == State::Starting {
+                        info!(
+                            target: "lazymc::monitor",
+                            "RCON connected while server is starting (status/ping unavailable); \
+                             marking server as started",
+                        );
+                        server.update_state(State::Started, &config).await;
+                    }
+                } else {
+                    // RCON also failed (or not enabled) — server is genuinely offline.
+                    server.update_status(&config, None).await;
+                }
+            }
 
             // Didn't get status, but ping fallback worked
             Ok(None) => {

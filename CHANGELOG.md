@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.21 (2026-04-05)
+
+- Fix: servers that never respond to status/ping probes (e.g. Folia) are now
+  detected as online via RCON when RCON is enabled. Previously, lazymc would
+  get stuck in `Starting` state or immediately flip back to `Stopped` because
+  the standard status/ping handshake always failed
+  - During startup (`Starting`): a successful RCON handshake is enough to
+    transition the server to `Started`
+  - While online (`Started`): RCON `list` is used each poll cycle as the sole
+    health and player-count signal; player count updates the idle timer so the
+    server is not put to sleep while players are connected
+  - If RCON also fails the server is correctly marked offline; failure streak
+    ≥ 3 escalates to `ERROR` log
+
 ## 0.2.20 (2026-04-03)
 
 - Log lazymc version on startup at INFO level
